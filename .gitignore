@@ -1,0 +1,11 @@
+﻿.env
+.env.*
+!.env.example
+
+*.exe
+*.out
+*.test
+coverage.txt
+coverage.html
+
+backend_backup/
