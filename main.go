@@ -9,6 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
+
+	authpkg "foodorder/auth"
+	"foodorder/mw"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -132,6 +136,24 @@ func main() {
 		log.Fatal("เชื่อมต่อ Database ไม่สำเร็จ:", err)
 	}
 
+	jwtSecret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+	if len(jwtSecret) < 32 {
+		log.Fatal("JWT_SECRET ต้องมีความยาวอย่างน้อย 32 ตัวอักษร")
+	}
+
+	issuer := &authpkg.Issuer{
+		Secret: []byte(jwtSecret),
+		TTL:    time.Hour,
+	}
+
+	loginRequired := func(next http.Handler) http.Handler {
+		return mw.RequireLogin(issuer, next)
+	}
+
+	roleRequired := func(role string, next http.Handler) http.Handler {
+		return loginRequired(mw.RequireRole(role, next))
+	}
+
 	mux := http.NewServeMux()
 
 	// Public API
@@ -144,92 +166,116 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /api/register", func(w http.ResponseWriter, r *http.Request) {
-		register(w, r, db)
+		register(w, r, db, issuer)
 	})
 
 	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
-		login(w, r, db)
+		login(w, r, db, issuer)
 	})
 
 	mux.HandleFunc("POST /api/logout", func(w http.ResponseWriter, r *http.Request) {
 		logout(w, r, db)
 	})
 
-	mux.Handle("GET /api/me", auth(db)(
+	mux.Handle("GET /api/me", loginRequired(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id, ok := mw.MemberID(r.Context())
+			if !ok {
+				fail(w, http.StatusUnauthorized, "กรุณาเข้าสู่ระบบ")
+				return
+			}
+
+			var username, role string
+			err := db.QueryRow(r.Context(),
+				`SELECT username, role FROM users WHERE id = $1`,
+				id,
+			).Scan(&username, &role)
+
+			if err == pgx.ErrNoRows {
+				fail(w, http.StatusUnauthorized, "ไม่พบผู้ใช้งาน")
+				return
+			}
+			if err != nil {
+				serverError(w, err)
+				return
+			}
+
 			writeJSON(w, http.StatusOK, map[string]string{
-				"username": getUsername(r),
-				"role":     getRole(r),
+				"username": username,
+				"role":     role,
 			})
 		}),
 	))
 
 	// Customer API
-	mux.Handle("GET /api/my/orders", auth(db, "customer")(
+	mux.Handle("GET /api/my/orders", roleRequired("customer",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			jsonQuery(w, r, db, ordersSQL, getUserID(r))
 		}),
 	))
 
-	mux.Handle("POST /api/orders", auth(db, "customer")(
+	mux.Handle("POST /api/orders", roleRequired("customer",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			createOrder(w, r, db)
 		}),
 	))
 
 	// Staff API
-	mux.Handle("GET /api/staff/orders", auth(db, "staff")(
+	mux.Handle("GET /api/staff/orders", roleRequired("staff",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			jsonQuery(w, r, db, ordersSQL, nil)
 		}),
 	))
 
-	mux.Handle("PATCH /api/staff/orders/{id}", auth(db, "staff")(
+	mux.Handle("PATCH /api/staff/orders/{id}", roleRequired("staff",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			setStatus(w, r, db)
 		}),
 	))
 
-	mux.Handle("DELETE /api/admin/menu/{id}", auth(db, "admin")(
+	// Admin API
+	mux.Handle("DELETE /api/admin/menu/{id}", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			deleteMenu(w, r, db)
 		}),
 	))
-	// Admin API
-	mux.Handle("GET /api/admin/menu", auth(db, "admin")(
+
+	mux.Handle("GET /api/admin/menu", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			jsonQuery(w, r, db,
 				`SELECT coalesce(json_agg(m ORDER BY m.id), '[]')::text
-				 FROM menu_items m`,
+					 FROM menu_items m`,
 			)
 		}),
 	))
-	mux.Handle("POST /api/admin/menu", auth(db, "admin")(
+
+	mux.Handle("POST /api/admin/menu", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			createMenu(w, r, db)
 		}),
 	))
-	mux.Handle("PATCH /api/admin/menu/{id}", auth(db, "admin")(
+
+	mux.Handle("PATCH /api/admin/menu/{id}", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			updateMenu(w, r, db)
 		}),
 	))
 
 	// Admin Order API
-	mux.Handle("GET /api/admin/orders", auth(db, "admin")(
+	mux.Handle("GET /api/admin/orders", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			jsonQuery(w, r, db, ordersSQL, nil)
 		}),
 	))
 
-	mux.Handle("PATCH /api/admin/orders/{id}", auth(db, "admin")(
+	mux.Handle("PATCH /api/admin/orders/{id}", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			setStatus(w, r, db)
 		}),
 	))
 
 	// Admin Dashboard API
-	mux.Handle("GET /api/admin/summary", auth(db, "admin")(
+	mux.Handle("GET /api/admin/summary", roleRequired("admin",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var summary struct {
 				OrderCount  int `json:"order_count"`
@@ -238,11 +284,11 @@ func main() {
 			}
 
 			err := db.QueryRow(r.Context(), `
-              SELECT
-                  (SELECT COUNT(*) FROM orders),
-                  (SELECT COALESCE(SUM(total), 0) FROM orders WHERE status = 'done'),
-                  (SELECT COUNT(*) FROM users WHERE role = 'customer')
-          `).Scan(
+					SELECT
+						(SELECT COUNT(*) FROM orders),
+						(SELECT COALESCE(SUM(total), 0) FROM orders WHERE status = 'done'),
+						(SELECT COUNT(*) FROM users WHERE role = 'customer')
+				`).Scan(
 				&summary.OrderCount,
 				&summary.TotalSales,
 				&summary.MemberCount,
@@ -258,15 +304,15 @@ func main() {
 	))
 
 	port := strings.TrimSpace(os.Getenv("PORT"))
-if port == "" {
-    port = "8080"
-}
+	if port == "" {
+		port = "8080"
+	}
 
-log.Println("Server running on port " + port)
+	log.Println("Server running on port " + port)
 
-if err := http.ListenAndServe(":"+port, cors(mux)); err != nil {
-    log.Fatal(err)
-}
+	if err := http.ListenAndServe(":"+port, cors(mux)); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // getDatabaseURL reads the database connection string.
@@ -617,23 +663,22 @@ func serverError(w http.ResponseWriter, err error) {
 
 // cors allows requests from the configured frontend.
 func cors(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                origin := r.Header.Get("Origin")
-                allowedOrigin := strings.TrimSpace(os.Getenv("FRONTEND_URL"))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allowedOrigin := strings.TrimSpace(os.Getenv("FRONTEND_URL"))
 
-                if origin != "" && origin == allowedOrigin {
-                        w.Header().Set("Access-Control-Allow-Origin", origin)
-                        w.Header().Set("Access-Control-Allow-Credentials", "true")
-                        w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-                        w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-                        w.Header().Set("Vary", "Origin")
-                }
+		if origin != "" && origin == allowedOrigin {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Vary", "Origin")
+		}
 
-                if r.Method == "OPTIONS" {
-                        w.WriteHeader(http.StatusNoContent)
-                        return
-                }
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 
-                next.ServeHTTP(w, r)
-        })
+		next.ServeHTTP(w, r)
+	})
 }
