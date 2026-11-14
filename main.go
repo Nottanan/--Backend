@@ -151,8 +151,37 @@ func main() {
 	}
 
 	roleRequired := func(role string, next http.Handler) http.Handler {
-		return loginRequired(mw.RequireRole(role, next))
-	}
+    return loginRequired(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        id, ok := mw.MemberID(r.Context())
+        if !ok {
+            fail(w, http.StatusUnauthorized, "กรุณาเข้าสู่ระบบ")
+            return
+        }
+
+        var currentRole string
+        err := db.QueryRow(r.Context(),
+            `SELECT role FROM users WHERE id = $1`,
+            id,
+        ).Scan(&currentRole)
+
+        if err == pgx.ErrNoRows {
+            fail(w, http.StatusUnauthorized, "ไม่พบผู้ใช้งาน")
+            return
+        }
+
+        if err != nil {
+            serverError(w, err)
+            return
+        }
+
+        if currentRole != role {
+            fail(w, http.StatusForbidden, "ไม่มีสิทธิ์เข้าถึง")
+            return
+        }
+
+        next.ServeHTTP(w, r)
+    }))
+}
 
 	mux := http.NewServeMux()
 
@@ -230,6 +259,25 @@ func main() {
 	mux.Handle("PATCH /api/staff/orders/{id}", roleRequired("staff",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			setStatus(w, r, db)
+		}),
+	))
+
+	// Admin Member API
+	mux.Handle("GET /api/admin/members", roleRequired("admin",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			listMembers(w, r, db)
+		}),
+	))
+
+	mux.Handle("PATCH /api/admin/members/{id}", roleRequired("admin",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			updateMemberRole(w, r, db)
+		}),
+	))
+
+	mux.Handle("DELETE /api/admin/members/{id}", roleRequired("admin",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			deleteMember(w, r, db)
 		}),
 	))
 
@@ -622,6 +670,114 @@ func deleteMenu(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
 
 	if tag.RowsAffected() == 0 {
 		fail(w, http.StatusNotFound, "ไม่พบเมนู")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func listMembers(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
+	jsonQuery(w, r, db,
+		`SELECT COALESCE(
+                        json_agg(
+                                json_build_object(
+                                        'id', id,
+                                        'username', username,
+                                        'role', role
+                                ) ORDER BY id
+                        ),
+                        '[]'
+                )::text
+                FROM users`,
+	)
+}
+
+func updateMemberRole(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id <= 0 {
+		fail(w, http.StatusBadRequest, "รหัสสมาชิกไม่ถูกต้อง")
+		return
+	}
+
+	currentID, ok := mw.MemberID(r.Context())
+	if !ok {
+		fail(w, http.StatusUnauthorized, "กรุณาเข้าสู่ระบบ")
+		return
+	}
+
+	if int64(id) == currentID {
+		fail(w, http.StatusForbidden, "ไม่สามารถเปลี่ยน Role ของบัญชีตัวเองได้")
+		return
+	}
+
+	var req struct {
+		Role string `json:"role"`
+	}
+
+	if err := decodeJSON(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, "ข้อมูลไม่ถูกต้อง")
+		return
+	}
+
+	if req.Role != "customer" &&
+		req.Role != "staff" &&
+		req.Role != "admin" {
+		fail(w, http.StatusBadRequest, "Role ไม่ถูกต้อง")
+		return
+	}
+
+	tag, err := db.Exec(r.Context(),
+		`UPDATE users SET role = $1 WHERE id = $2`,
+		req.Role,
+		id,
+	)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+
+	if tag.RowsAffected() == 0 {
+		fail(w, http.StatusNotFound, "ไม่พบสมาชิก")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func deleteMember(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id <= 0 {
+		fail(w, http.StatusBadRequest, "รหัสสมาชิกไม่ถูกต้อง")
+		return
+	}
+
+	currentID, ok := mw.MemberID(r.Context())
+	if !ok {
+		fail(w, http.StatusUnauthorized, "กรุณาเข้าสู่ระบบ")
+		return
+	}
+
+	if int64(id) == currentID {
+		fail(w, http.StatusForbidden, "ไม่สามารถลบบัญชีตัวเองได้")
+		return
+	}
+
+	tag, err := db.Exec(r.Context(),
+		`DELETE FROM users WHERE id = $1`,
+		id,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "foreign key constraint") {
+			fail(w, http.StatusConflict, "ไม่สามารถลบสมาชิกได้ เนื่องจากมีประวัติการสั่งซื้อ")
+			return
+		}
+
+		serverError(w, err)
+		return
+	}
+
+	if tag.RowsAffected() == 0 {
+		fail(w, http.StatusNotFound, "ไม่พบสมาชิก")
 		return
 	}
 
